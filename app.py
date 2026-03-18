@@ -8,6 +8,7 @@ import re
 import struct
 import threading
 import time
+
 import transformers
 from curl_cffi import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -810,6 +811,8 @@ def messages_prepare(messages: list) -> str:
 
 # 添加保活超时配置（5秒）
 KEEP_ALIVE_TIMEOUT = 5
+# 上游流长时间无新数据时，强制收尾，避免无限等待
+STREAM_IDLE_TIMEOUT = 60
 
 
 def is_finished_event(chunk):
@@ -943,6 +946,7 @@ async def chat_completions(request: Request):
 
                     def process_data():
                         ptype = "text"
+                        completion_signaled = False
                         try:
                             for raw_line in deepseek_resp.iter_lines():
                                 try:
@@ -958,6 +962,7 @@ async def chat_completions(request: Request):
                                     except json.JSONDecodeError:
                                         # 如果JSON解析也失败，创建最基本的错误响应
                                         result_queue.put({"choices": [{"index": 0, "delta": {"content": "解码失败", "type": "text"}}]})
+                                    completion_signaled = True
                                     result_queue.put(None)
                                     break
                                 if not line:
@@ -965,6 +970,7 @@ async def chat_completions(request: Request):
                                 if line.startswith("data:"):
                                     data_str = line[5:].strip()
                                     if data_str == "[DONE]":
+                                        completion_signaled = True
                                         result_queue.put(None)  # 结束信号
                                         break
                                     try:
@@ -973,6 +979,7 @@ async def chat_completions(request: Request):
                                         if "v" in chunk:
                                             if is_finished_event(chunk):
                                                 # 最终完成信号
+                                                completion_signaled = True
                                                 result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
                                                 result_queue.put(None)
                                                 return
@@ -1029,6 +1036,7 @@ async def chat_completions(request: Request):
                                         except json.JSONDecodeError:
                                             # 如果JSON解析也失败，创建最基本的错误响应
                                             result_queue.put({"choices": [{"index": 0, "delta": {"content": "解析失败", "type": "text"}}]})
+                                        completion_signaled = True
                                         result_queue.put(None)
                                         break
                         except Exception as e:
@@ -1040,15 +1048,20 @@ async def chat_completions(request: Request):
                             except Exception:
                                 # 最终备选方案
                                 pass
+                            completion_signaled = True
                             result_queue.put(None)
                             # raise HTTPException(
                                 # status_code=500, detail="Server is error."
                             # )
                         finally:
                             deepseek_resp.close()
+                            if not completion_signaled:
+                                # 兜底：上游自然结束但未显式发送完成信号
+                                result_queue.put(None)
 
                     process_thread = threading.Thread(target=process_data)
                     process_thread.start()
+                    last_chunk_time = time.time()
 
                     while True:
                         current_time = time.time()
@@ -1056,86 +1069,98 @@ async def chat_completions(request: Request):
 
                             yield ": keep-alive\n\n"
                             last_send_time = current_time
-                            continue
-                        try:
-                            chunk = result_queue.get(timeout=0.05)
-                            if chunk is None:
-                                # 发送最终统计信息
-                                prompt_tokens = len(final_prompt) // 4  # 简单估算token数
-                                thinking_tokens = len(final_thinking) // 4  # 简单估算token数
-                                completion_tokens = len(final_text) // 4  # 简单估算token数
-                                usage = {
-                                    "prompt_tokens": prompt_tokens,
-                                    "completion_tokens": thinking_tokens + completion_tokens,
-                                    "total_tokens": prompt_tokens + thinking_tokens + completion_tokens,
-                                    "completion_tokens_details": {
-                                        "reasoning_tokens": thinking_tokens
-                                    },
-                                }
-                                finish_chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": model,
-                                    "choices": [
-                                        {
-                                            "delta": {},
-                                            "index": 0,
-                                            "finish_reason": "stop",
-                                        }
-                                    ],
-                                    "usage": usage,
-                                }
-                                yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
-                                yield "data: [DONE]\n\n"
-                                last_send_time = current_time
-                                break
-                            new_choices = []
-                            for choice in chunk.get("choices", []):
-                                delta = choice.get("delta", {})
-                                ctype = delta.get("type")
-                                ctext = delta.get("content", "")
-                                if (
-                                    choice
-                                    .get("finish_reason")
-                                    == "backend_busy"
-                                ):
-                                    ctext = '服务器繁忙，请稍候再试'
-                                if search_enabled and ctext.startswith("[citation:"):
-                                    ctext = ""
-                                if ctype == "thinking":
-                                    if thinking_enabled:
-                                        final_thinking += ctext
-                                elif ctype == "text":
-                                    final_text += ctext
-                                delta_obj = {}
-                                if not first_chunk_sent:
-                                    delta_obj["role"] = "assistant"
-                                    first_chunk_sent = True
-                                if ctype == "thinking":
-                                    if thinking_enabled:
-                                        delta_obj["reasoning_content"] = ctext
-                                elif ctype == "text":
-                                    delta_obj["content"] = ctext
-                                if delta_obj:
-                                    new_choices.append(
-                                        {
-                                            "delta": delta_obj,
-                                            "index": choice.get("index", 0),
-                                        }
-                                    )
-                            if new_choices:
-                                out_chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": model,
-                                    "choices": new_choices,
-                                }
-                                yield f"data: {json.dumps(out_chunk, ensure_ascii=False)}\n\n"
-                                last_send_time = current_time
-                        except queue.Empty:
-                            continue
+                        if not process_thread.is_alive() and result_queue.empty():
+                            logger.warning("[sse_stream] 上游流已结束但无完成事件，强制收尾")
+                            chunk = None
+                        else:
+                            try:
+                                chunk = result_queue.get(timeout=0.05)
+                            except queue.Empty:
+                                if current_time - last_chunk_time >= STREAM_IDLE_TIMEOUT:
+                                    logger.warning("[sse_stream] 上游流长时间无数据，强制收尾")
+                                    try:
+                                        deepseek_resp.close()
+                                    except Exception:
+                                        pass
+                                    chunk = None
+                                else:
+                                    continue
+                        if chunk is None:
+                            # 发送最终统计信息
+                            prompt_tokens = len(final_prompt) // 4  # 简单估算token数
+                            thinking_tokens = len(final_thinking) // 4  # 简单估算token数
+                            completion_tokens = len(final_text) // 4  # 简单估算token数
+                            usage = {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": thinking_tokens + completion_tokens,
+                                "total_tokens": prompt_tokens + thinking_tokens + completion_tokens,
+                                "completion_tokens_details": {
+                                    "reasoning_tokens": thinking_tokens
+                                },
+                            }
+                            finish_chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "delta": {},
+                                        "index": 0,
+                                        "finish_reason": "stop",
+                                    }
+                                ],
+                                "usage": usage,
+                            }
+                            yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            last_send_time = current_time
+                            break
+                        last_chunk_time = current_time
+                        new_choices = []
+                        for choice in chunk.get("choices", []):
+                            delta = choice.get("delta", {})
+                            ctype = delta.get("type")
+                            ctext = delta.get("content", "")
+                            if (
+                                choice
+                                .get("finish_reason")
+                                == "backend_busy"
+                            ):
+                                ctext = '服务器繁忙，请稍候再试'
+                            if search_enabled and ctext.startswith("[citation:"):
+                                ctext = ""
+                            if ctype == "thinking":
+                                if thinking_enabled:
+                                    final_thinking += ctext
+                            elif ctype == "text":
+                                final_text += ctext
+                            delta_obj = {}
+                            if not first_chunk_sent:
+                                delta_obj["role"] = "assistant"
+                                first_chunk_sent = True
+                            if ctype == "thinking":
+                                if thinking_enabled:
+                                    delta_obj["reasoning_content"] = ctext
+                            elif ctype == "text":
+                                delta_obj["content"] = ctext
+                            if delta_obj:
+                                new_choices.append(
+                                    {
+                                        "delta": delta_obj,
+                                        "index": choice.get("index", 0),
+                                    }
+                                )
+                        if new_choices:
+                            out_chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": model,
+                                "choices": new_choices,
+                            }
+                            yield f"data: {json.dumps(out_chunk, ensure_ascii=False)}\n\n"
+                            last_send_time = current_time
                 except Exception as e:
                     logger.error(f"[sse_stream] 异常: {e}")
                 finally:
