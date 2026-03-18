@@ -812,6 +812,47 @@ def messages_prepare(messages: list) -> str:
 KEEP_ALIVE_TIMEOUT = 5
 
 
+def is_finished_event(chunk):
+    """判断 DeepSeek chunk 是否表示对话已完成。"""
+    if not isinstance(chunk, dict):
+        return False
+    chunk_path = chunk.get("p")
+    chunk_value = chunk.get("v")
+    if (
+        isinstance(chunk_path, str)
+        and chunk_path.strip("/").endswith("status")
+        and chunk_value == "FINISHED"
+    ):
+        return True
+    if isinstance(chunk_value, list):
+        for item in chunk_value:
+            if not isinstance(item, dict):
+                continue
+            item_path = item.get("p")
+            if (
+                isinstance(item_path, str)
+                and item_path.strip("/").endswith("status")
+                and item.get("v") == "FINISHED"
+            ):
+                return True
+    return False
+
+
+def get_chunk_content_type(chunk):
+    """根据 chunk 路径识别内容类型。"""
+    chunk_path = chunk.get("p")
+    if not isinstance(chunk_path, str):
+        return None
+    normalized_path = chunk_path.strip("/")
+    if normalized_path.endswith("search_status"):
+        return "search_status"
+    if normalized_path.endswith("thinking_content"):
+        return "thinking"
+    if normalized_path.endswith("content"):
+        return "text"
+    return None
+
+
 # ----------------------------------------------------------------------
 # (10) 路由：/v1/chat/completions
 # ----------------------------------------------------------------------
@@ -930,32 +971,34 @@ async def chat_completions(request: Request):
                                         chunk = json.loads(data_str)
                                         
                                         if "v" in chunk:
-                                            v_value = chunk["v"]
-                                            
-                                            # 构造新的 delta 格式的 chunk
-                                            content = ""
+                                            if is_finished_event(chunk):
+                                                # 最终完成信号
+                                                result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
+                                                result_queue.put(None)
+                                                return
 
-                                            if "p" in chunk and chunk.get("p") == "response/search_status":
+                                            v_value = chunk["v"]
+                                            content = ""
+                                            chunk_type = get_chunk_content_type(chunk)
+
+                                            if chunk_type == "search_status":
                                                 continue
                                                 
-                                            if "p" in chunk and chunk.get("p") == "response/thinking_content":
+                                            if chunk_type == "thinking":
                                                 ptype = "thinking"
-                                            elif "p" in chunk and chunk.get("p") == "response/content":
+                                            elif chunk_type == "text":
                                                 ptype = "text"
 
-                                            # 处理文本内容
                                             if isinstance(v_value, str):
+                                                # 仅输出正文/思考内容，避免将 status 等控制事件误当文本
+                                                if chunk_type is None and "p" in chunk:
+                                                    continue
                                                 content = v_value
-                                            # 处理数组更新如状态变更
                                             elif isinstance(v_value, list):
-                                                for item in v_value:
-                                                    if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                                        # 最终完成信号
-                                                        result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
-                                                        result_queue.put(None)
-                                                        return
                                                 continue
-                                            
+                                            else:
+                                                continue
+                                             
                                             # 构造兼容原逻辑的 chunk
                                             unified_chunk = {
                                                 "choices": [{
@@ -1143,62 +1186,64 @@ async def chat_completions(request: Request):
             
                                 # 提取 v 字段
                                 if "v" in chunk:
+                                    if is_finished_event(chunk):
+                                        # 构建最终结果
+                                        final_reasoning = "".join(think_list)
+                                        final_content = "".join(text_list)
+                                        prompt_tokens = len(final_prompt) // 4  # 简单估算token数
+                                        reasoning_tokens = len(final_reasoning) // 4  # 简单估算token数
+                                        completion_tokens = len(final_content) // 4  # 简单估算token数
+                                        result = {
+                                            "id": completion_id,
+                                            "object": "chat.completion",
+                                            "created": created_time,
+                                            "model": model,
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "message": {
+                                                        "role": "assistant",
+                                                        "content": final_content,
+                                                        "reasoning_content": final_reasoning,
+                                                    },
+                                                    "finish_reason": "stop",
+                                                }
+                                            ],
+                                            "usage": {
+                                                "prompt_tokens": prompt_tokens,
+                                                "completion_tokens": reasoning_tokens + completion_tokens,
+                                                "total_tokens": prompt_tokens + reasoning_tokens + completion_tokens,
+                                                "completion_tokens_details": {
+                                                    "reasoning_tokens": reasoning_tokens
+                                                },
+                                            },
+                                        }
+                                        data_queue.put("DONE")
+                                        return  # 提前返回，结束函数
+
                                     v_value = chunk["v"]
+                                    chunk_type = get_chunk_content_type(chunk)
                                     
-                                    if "p" in chunk and chunk.get("p") == "response/search_status":
+                                    if chunk_type == "search_status":
                                         continue
                                                 
-                                    if "p" in chunk and chunk.get("p") == "response/thinking_content":
+                                    if chunk_type == "thinking":
                                         ptype = "thinking"
-                                    elif "p" in chunk and chunk.get("p") == "response/content":
+                                    elif chunk_type == "text":
                                         ptype = "text"
             
                                     # 处理字符串形式的 v 值（即文本内容）
                                     if isinstance(v_value, str):
+                                        if chunk_type is None and "p" in chunk:
+                                            continue
                                         if search_enabled and v_value.startswith("[citation:"):
                                             continue  # 跳过 citation 内容
                                         if ptype == "thinking":
                                             think_list.append(v_value)
                                         else:
                                             text_list.append(v_value)
-            
-                                    # 处理数组更新如状态变更
                                     elif isinstance(v_value, list):
-                                        for item in v_value:
-                                            if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                                # 构建最终结果
-                                                final_reasoning = "".join(think_list)
-                                                final_content = "".join(text_list)
-                                                prompt_tokens = len(final_prompt) // 4  # 简单估算token数
-                                                reasoning_tokens = len(final_reasoning) // 4  # 简单估算token数
-                                                completion_tokens = len(final_content) // 4  # 简单估算token数
-                                                result = {
-                                                    "id": completion_id,
-                                                    "object": "chat.completion",
-                                                    "created": created_time,
-                                                    "model": model,
-                                                    "choices": [
-                                                        {
-                                                            "index": 0,
-                                                            "message": {
-                                                                "role": "assistant",
-                                                                "content": final_content,
-                                                                "reasoning_content": final_reasoning,
-                                                            },
-                                                            "finish_reason": "stop",
-                                                        }
-                                                    ],
-                                                    "usage": {
-                                                        "prompt_tokens": prompt_tokens,
-                                                        "completion_tokens": reasoning_tokens + completion_tokens,
-                                                        "total_tokens": prompt_tokens + reasoning_tokens + completion_tokens,
-                                                        "completion_tokens_details": {
-                                                            "reasoning_tokens": reasoning_tokens
-                                                        },
-                                                    },
-                                                }
-                                                data_queue.put("DONE")
-                                                return  # 提前返回，结束函数
+                                        continue
             
                             except Exception as e:
                                 logger.warning(f"[collect_data] 无法解析: {data_str}, 错误: {e}")
@@ -1444,14 +1489,19 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                                 
                             try:
                                 chunk = json.loads(data_str)
-                                if "v" in chunk and isinstance(chunk["v"], str):
-                                    full_response_text += chunk["v"]
-                                elif "v" in chunk and isinstance(chunk["v"], list):
-                                    # 检查完成状态
-                                    for item in chunk["v"]:
-                                        if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                            response_completed = True
-                                            break
+                                if "v" in chunk:
+                                    if is_finished_event(chunk):
+                                        response_completed = True
+                                        break
+
+                                    v_value = chunk["v"]
+                                    chunk_type = get_chunk_content_type(chunk)
+                                    if chunk_type == "search_status":
+                                        continue
+                                    if isinstance(v_value, str):
+                                        if chunk_type is None and "p" in chunk:
+                                            continue
+                                        full_response_text += v_value
                             except (json.JSONDecodeError, KeyError):
                                 continue
                     
@@ -1629,18 +1679,24 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                             
                             # 使用DeepSeek的响应格式解析 - 提取 v 字段
                             if "v" in chunk:
+                                if is_finished_event(chunk):
+                                    break
+
                                 v_value = chunk["v"]
+                                chunk_type = get_chunk_content_type(chunk)
                                 
                                 # 跳过搜索状态
-                                if "p" in chunk and chunk.get("p") == "response/search_status":
+                                if chunk_type == "search_status":
                                     continue
                                     
                                 # 判断内容类型
                                 ptype = "text"
-                                if "p" in chunk and chunk.get("p") == "response/thinking_content":
+                                if chunk_type == "thinking":
                                     ptype = "thinking"
-                                elif "p" in chunk and chunk.get("p") == "response/content":
+                                elif chunk_type == "text":
                                     ptype = "text"
+                                elif chunk_type is None and "p" in chunk:
+                                    continue
                                 
                                 # 处理字符串形式的 v 值（即文本内容）
                                 if isinstance(v_value, str):
@@ -1648,13 +1704,8 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                                         final_reasoning += v_value
                                     else:
                                         final_content += v_value
-                                        
-                                # 处理数组更新如状态变更
                                 elif isinstance(v_value, list):
-                                    for item in v_value:
-                                        if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                            # 完成标志
-                                            break
+                                    continue
                                             
                         except json.JSONDecodeError as e:
                             logger.warning(f"[claude_messages] JSON解析失败: {e}, data: {data_str}")
